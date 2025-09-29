@@ -2150,10 +2150,16 @@ static int android_device_create(struct gadget_info *gi)
 	struct device *device;
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
+	char dev_name[10];
+
+	snprintf(dev_name, sizeof(dev_name), "%s", gi->composite.name);
+
+	if (strcmp(dev_name, "g1") == 0)
+		snprintf(dev_name, sizeof(dev_name), "android0");
 
 	INIT_WORK(&gi->work, android_work);
 	device = device_create(android_class, NULL,
-				MKDEV(0, 0), NULL, "android0");
+				MKDEV(0, 0), NULL, dev_name);
 	if (IS_ERR(device))
 		return PTR_ERR(device);
 

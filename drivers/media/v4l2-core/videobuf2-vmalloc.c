@@ -437,8 +437,8 @@ const struct vb2_mem_ops vb2_vmalloc_memops = {
 #ifdef CONFIG_HAS_DMA
 	.get_dmabuf	= vb2_vmalloc_get_dmabuf,
 #endif
-	.map_dmabuf	= vb2_vmalloc_map_dmabuf,
-	.unmap_dmabuf	= vb2_vmalloc_unmap_dmabuf,
+	.map_dmabuf	= ( int (*)(void*, size_t)) vb2_vmalloc_map_dmabuf,
+	.unmap_dmabuf	= ( void (*)(void*, size_t)) vb2_vmalloc_unmap_dmabuf,
 	.attach_dmabuf	= vb2_vmalloc_attach_dmabuf,
 	.detach_dmabuf	= vb2_vmalloc_detach_dmabuf,
 	.vaddr		= vb2_vmalloc_vaddr,
