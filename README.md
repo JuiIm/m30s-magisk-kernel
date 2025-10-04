@@ -17,7 +17,7 @@ Provides **untethered Magisk root** for system-as-root (no-ramdisk) devices, so 
 - This kernel includes **Magisk by default**.  
 - **KernelSU** is supported but set to n in defconfig it is not recommended to enable it in this build as it's there for previous builds purposes.  
 - Compatible only with **Galaxy M30s (SM-M307)**. Do **not** flash on other devices.  
-
+- XDA Forum: https://xdaforums.com/t/kernel-magisk-untethered-magisk-boot-image-for-galaxy-m30s.4762170/
 ---
 
 ## Building
