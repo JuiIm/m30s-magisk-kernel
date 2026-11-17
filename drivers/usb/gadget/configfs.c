@@ -27,6 +27,8 @@ extern int terminal_ctrl_request(struct usb_composite_dev *cdev,
 #endif
 static struct class *android_class;
 static struct device *android_device;
+/* serializes changes of android_device and the UDC handover */
+static DEFINE_MUTEX(android_device_lock);
 static int index;
 
 struct device *create_function_device(char *name)
@@ -117,6 +119,8 @@ struct gadget_info {
 	struct device *dev;
 	struct list_head linked_func;
 	bool symboliclink_change_mode;
+	/* primary gadget only: UDC to bind once another gadget lets go of it */
+	char *udc_deferred;
 #endif
 };
 
@@ -343,18 +347,95 @@ static ssize_t gadget_dev_desc_UDC_show(struct config_item *item, char *page)
 	return sprintf(page, "%s\n", udc_name ?: "");
 }
 
-static int unregister_gadget(struct gadget_info *gi)
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+/*
+ * The primary gadget is the one Samsung init and the Android framework drive
+ * through /sys/class/android_usb/android0 (normally g1). It keeps the Samsung
+ * behaviour (functions/enable attributes, linked_func). Every other gadget
+ * behaves like a plain upstream configfs gadget.
+ */
+static bool gadget_is_android_primary(struct gadget_info *gi)
 {
+	return gi->dev && gi->dev == android_device;
+}
+
+/*
+ * A gadget other than the primary one released the UDC. If the primary
+ * gadget is waiting for it (see android_udc_handover() and the UDC store),
+ * bind it again now.
+ *
+ * Called with gi->lock held.
+ */
+static void android_udc_give_back(struct gadget_info *gi, const char *udc_name)
+{
+	struct gadget_info *primary;
 	int ret;
 
-	if (!gi->composite.gadget_driver.udc_name)
+	/*
+	 * The primary gadget must never take android_device_lock while it
+	 * holds its own lock (the handover takes them in the other order).
+	 */
+	if (gadget_is_android_primary(gi))
+		return;
+
+	mutex_lock(&android_device_lock);
+	if (IS_ERR_OR_NULL(android_device))
+		goto out;
+
+	primary = dev_get_drvdata(android_device);
+	if (!primary || primary == gi)
+		goto out;
+
+	mutex_lock_nested(&primary->lock, SINGLE_DEPTH_NESTING);
+	if (primary->udc_deferred &&
+	    !primary->composite.gadget_driver.udc_name &&
+	    !strcmp(primary->udc_deferred, udc_name)) {
+		primary->composite.gadget_driver.udc_name =
+						primary->udc_deferred;
+		primary->udc_deferred = NULL;
+		ret = usb_gadget_probe_driver(
+				&primary->composite.gadget_driver);
+		if (ret) {
+			pr_err("usb: %s: cannot give UDC %s back to %s (%d)\n",
+				__func__, udc_name, primary->composite.name,
+				ret);
+			kfree(primary->composite.gadget_driver.udc_name);
+			primary->composite.gadget_driver.udc_name = NULL;
+		} else {
+			pr_info("usb: %s: UDC %s is back with %s\n", __func__,
+				udc_name, primary->composite.name);
+#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
+			/* same as enable_store() does after a normal bind */
+			if (primary->enabled)
+				primary->cdev.next_string_id = 4;
+#endif
+		}
+	}
+	mutex_unlock(&primary->lock);
+out:
+	mutex_unlock(&android_device_lock);
+}
+#else
+static inline void android_udc_give_back(struct gadget_info *gi,
+		const char *udc_name)
+{
+}
+#endif
+
+static int unregister_gadget(struct gadget_info *gi)
+{
+	char *udc_name = gi->composite.gadget_driver.udc_name;
+	int ret;
+
+	if (!udc_name)
 		return -ENODEV;
 
 	ret = usb_gadget_unregister_driver(&gi->composite.gadget_driver);
 	if (ret)
 		return ret;
-	kfree(gi->composite.gadget_driver.udc_name);
 	gi->composite.gadget_driver.udc_name = NULL;
+	android_udc_give_back(gi, udc_name);
+	kfree(udc_name);
 	return 0;
 }
 
@@ -378,6 +459,75 @@ static void clear_current_usb_link(struct usb_composite_dev *cdev)
 		}
 	}
 }
+
+/* gi->lock must be held */
+static int gadget_release_udc(struct gadget_info *gi)
+{
+	int ret;
+
+	ret = unregister_gadget(gi);
+	if (ret)
+		return ret;
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	if (!list_empty(&gi->linked_func) && gi->symboliclink_change_mode) {
+		pr_info("usb: %s: GSI_image : Clear cfg->func_list\n", __func__);
+		clear_current_usb_link(&gi->cdev);
+	}
+#endif
+	return 0;
+}
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+/*
+ * This SoC has a single UDC and the stock Android gadget (android0, normally
+ * g1) owns it from boot. Unbinding g1 from userspace first leaves a window in
+ * which init can bind it again before the other gadget gets the UDC.
+ *
+ * So when another gadget asks for a UDC that the primary Android gadget
+ * holds, release it here, exactly like writing "none" to the primary
+ * gadget's UDC attribute. The caller then binds the UDC without a window.
+ * The primary gadget never takes a UDC this way: while another gadget holds
+ * it, writes to g1/UDC fail with -EBUSY and are remembered in udc_deferred.
+ * The primary gadget is bound again when the other gadget lets go, see
+ * android_udc_give_back().
+ *
+ * Called with gi->lock held. Returns 0 if the UDC was released.
+ */
+static int android_udc_handover(struct gadget_info *gi, const char *udc_name)
+{
+	struct gadget_info *primary;
+	const char *held;
+	int ret = -EBUSY;
+
+	mutex_lock(&android_device_lock);
+	if (IS_ERR_OR_NULL(android_device))
+		goto out;
+
+	primary = dev_get_drvdata(android_device);
+	if (!primary || primary == gi)
+		goto out;
+
+	mutex_lock_nested(&primary->lock, SINGLE_DEPTH_NESTING);
+	held = primary->composite.gadget_driver.udc_name;
+	if (held && !strcmp(held, udc_name)) {
+		char *wanted = kstrdup(held, GFP_KERNEL);
+
+		pr_info("usb: %s: gadget %s takes UDC %s from %s\n", __func__,
+			gi->composite.name, udc_name, primary->composite.name);
+		ret = gadget_release_udc(primary);
+		if (!ret) {
+			kfree(primary->udc_deferred);
+			primary->udc_deferred = wanted;
+		} else {
+			kfree(wanted);
+		}
+	}
+	mutex_unlock(&primary->lock);
+out:
+	mutex_unlock(&android_device_lock);
+	return ret;
+}
+#endif
 
 static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 		const char *page, size_t len)
@@ -415,16 +565,19 @@ static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 	mutex_lock(&gi->lock);
 
 	if (!strlen(name) || strcmp(name, "none") == 0) {
-		ret = unregister_gadget(gi);
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+		if (gi->udc_deferred &&
+		    !gi->composite.gadget_driver.udc_name) {
+			/* not bound, only waiting for the UDC: stop waiting */
+			kfree(gi->udc_deferred);
+			gi->udc_deferred = NULL;
+			ret = 0;
+		} else
+#endif
+		ret = gadget_release_udc(gi);
 		if (ret)
 			goto err;
 		kfree(name);
-#ifdef CONFIG_USB_CONFIGFS_UEVENT
-		if (!list_empty(&gi->linked_func) && gi->symboliclink_change_mode) {
-			pr_info("usb: %s: GSI_image : Clear cfg->func_list\n", __func__);
-			clear_current_usb_link(cdev);
-		}
-#endif
 	} else {
 		if (gi->composite.gadget_driver.udc_name) {
 			ret = -EBUSY;
@@ -432,10 +585,39 @@ static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 		}
 		gi->composite.gadget_driver.udc_name = name;
 		ret = usb_gadget_probe_driver(&gi->composite.gadget_driver);
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+		if (ret == -EBUSY && gadget_is_android_primary(gi)) {
+			/*
+			 * Another gadget holds the UDC. Do not take it away;
+			 * bind when that gadget lets go of it.
+			 */
+			pr_info("usb: %s: UDC %s is busy, %s will bind later\n",
+				__func__, name, gi->composite.name);
+			gi->composite.gadget_driver.udc_name = NULL;
+			kfree(gi->udc_deferred);
+			gi->udc_deferred = name;
+			mutex_unlock(&gi->lock);
+			return -EBUSY;
+		}
+		if (ret == -EBUSY && !android_udc_handover(gi, name)) {
+			ret = usb_gadget_probe_driver(
+					&gi->composite.gadget_driver);
+			if (ret) {
+				/* this gadget cannot bind: undo the handover */
+				gi->composite.gadget_driver.udc_name = NULL;
+				android_udc_give_back(gi, name);
+				goto err;
+			}
+		}
+#endif
 		if (ret) {
 			gi->composite.gadget_driver.udc_name = NULL;
 			goto err;
 		}
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+		kfree(gi->udc_deferred);
+		gi->udc_deferred = NULL;
+#endif
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
 		if (gi->symboliclink_change_mode) {
 			pr_info("usb: %s : gi->symboliclink_change_mode = %d\n", __func__,
@@ -504,6 +686,9 @@ static void gadget_info_attr_release(struct config_item *item)
 	WARN_ON(!list_empty(&gi->string_list));
 	WARN_ON(!list_empty(&gi->available_func));
 	kfree(gi->composite.gadget_driver.function);
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	kfree(gi->udc_deferred);
+#endif
 	kfree(gi);
 }
 
@@ -636,6 +821,33 @@ static int config_usb_cfg_link(
 		ret = -EINVAL;
 		goto out;
 	}
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	if (!gadget_is_android_primary(gi)) {
+		/*
+		 * Only the primary gadget has its functions picked through
+		 * android0/functions. For any other gadget the Samsung code
+		 * below would park the function in linked_func, where nothing
+		 * moves it into the config, and the bind would fail with
+		 * "needs at least one function". Do what upstream does.
+		 */
+		list_for_each_entry(f, &cfg->func_list, list) {
+			if (f->fi == fi) {
+				ret = -EEXIST;
+				goto out;
+			}
+		}
+		f = usb_get_function(fi);
+		if (IS_ERR(f)) {
+			ret = PTR_ERR(f);
+			goto out;
+		}
+		/* stash the function until we bind it to the gadget */
+		list_add_tail(&f->list, &cfg->func_list);
+		ret = 0;
+		goto out;
+	}
+#endif
 
 	list_for_each_entry(f, &cfg->func_list, list) {
 		if (f->fi == fi) {
@@ -1693,10 +1905,10 @@ static void android_work(struct work_struct *data)
 	bool status[3] = { false, false, false };
 	unsigned long flags;
 	bool uevent_sent = false;
-	if (!android_device && IS_ERR(android_device)) {
-		pr_info("usb: cannot send uevent because android_device not available \n");
+	if (IS_ERR_OR_NULL(gi->dev)) {
+		pr_info("usb: cannot send uevent because android device not available\n");
 		return;
-	}	
+	}
 	spin_lock_irqsave(&cdev->lock, flags);
 	if (cdev->config)
 		status[1] = true;
@@ -1711,7 +1923,7 @@ static void android_work(struct work_struct *data)
 	spin_unlock_irqrestore(&cdev->lock, flags);
 
 	if (status[0]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, connected);
 		pr_info("usb: %s: sent uevent %s\n", __func__, connected[0]);
 		uevent_sent = true;
@@ -1727,7 +1939,7 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[1]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, configured);
 		pr_info("usb: %s: sent uevent %s\n", __func__, configured[0]);
 		uevent_sent = true;
@@ -1737,7 +1949,7 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[2]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, disconnected);
 		pr_info("usb: %s: sent uevent %s\n", __func__, disconnected[0]);
 		uevent_sent = true;
@@ -1818,12 +2030,13 @@ static int android_setup(struct usb_gadget *gadget,
 			}
 		}
 	}
+	/* terminal mode and accessory requests belong to the Android gadget */
 #ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-	if (value < 0)
+	if (value < 0 && gadget_is_android_primary(gi))
 		value = terminal_ctrl_request(cdev, c);
 #endif
 #ifdef CONFIG_USB_CONFIGFS_F_ACC
-	if (value < 0)
+	if (value < 0 && gadget_is_android_primary(gi))
 		value = acc_ctrlrequest(cdev, c);
 #endif
 
@@ -1869,7 +2082,8 @@ static void android_disconnect(struct usb_gadget *gadget)
 	*/
 
 #ifdef CONFIG_USB_CONFIGFS_F_ACC
-	acc_disconnect();
+	if (gadget_is_android_primary(gi))
+		acc_disconnect();
 #endif
 	gi->connected = 0;
 #ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
@@ -2051,6 +2265,17 @@ static ssize_t enable_store(struct device *pdev, struct device_attribute *attr,
 #else
 		cdev->next_string_id = 0;
 #endif
+		if (!gadget && dev->udc_deferred) {
+			/*
+			 * The UDC is with another gadget. The bind that
+			 * happens when it comes back also connects.
+			 */
+			pr_info("usb: %s: UDC is busy, connect later\n",
+				__func__);
+			dev->enabled = true;
+			mutex_unlock(&dev->lock);
+			return size;
+		}
 		if (!gadget) {
 			pr_info("usb: %s: Gadget is NULL\n", __func__);
 			mutex_unlock(&dev->lock);
@@ -2075,7 +2300,11 @@ static ssize_t enable_store(struct device *pdev, struct device_attribute *attr,
 		store_usblog_notify(NOTIFY_USBMODE_EXTRA, "enable 0", NULL);
 #endif
 		unregister_gadget(dev);
-		clear_current_usb_link(cdev);
+		kfree(dev->udc_deferred);
+		dev->udc_deferred = NULL;
+		/* only the primary gadget keeps its functions in linked_func */
+		if (gadget_is_android_primary(dev))
+			clear_current_usb_link(cdev);
 		dev->enabled = false;
 	} else {
 #ifdef CONFIG_USB_NOTIFY_PROC_LOG
@@ -2145,51 +2374,81 @@ static struct device_attribute *android_usb_attributes[] = {
 	NULL
 };
 
+/*
+ * Every gadget gets its own device in /sys/class/android_usb.
+ *
+ * Samsung init and the Android framework expect the stock gadget (g1) at
+ * /sys/class/android_usb/android0, so g1 keeps that name. Any other gadget
+ * uses its own configfs name. The global android_device only tracks the
+ * first (primary) gadget; the Samsung function drivers hang their devices
+ * under it (see create_function_device()).
+ */
 static int android_device_create(struct gadget_info *gi)
 {
-	struct device *device;
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
-	char dev_name[10];
+	const char *name = gi->composite.name;
+	struct device *device;
 
-	snprintf(dev_name, sizeof(dev_name), "%s", gi->composite.name);
-
-	if (strcmp(dev_name, "g1") == 0)
-		snprintf(dev_name, sizeof(dev_name), "android0");
+	if (strcmp(name, "g1") == 0)
+		name = "android0";
 
 	INIT_WORK(&gi->work, android_work);
 	device = device_create(android_class, NULL,
-				MKDEV(0, 0), NULL, dev_name);
-	if (IS_ERR(device))
+				MKDEV(0, 0), NULL, "%s", name);
+	if (IS_ERR(device)) {
+		pr_err("usb: %s: cannot create android_usb/%s for gadget %s (%ld)\n",
+			__func__, name, gi->composite.name, PTR_ERR(device));
 		return PTR_ERR(device);
+	}
 
-	android_device = device;
-	dev_set_drvdata(android_device, gi);
+	dev_set_drvdata(device, gi);
 
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++)) {
 		int err;
 
-		err = device_create_file(android_device, attr);
+		err = device_create_file(device, attr);
 		if (err) {
-			device_destroy(android_device->class,
-				       android_device->devt);
+			/*
+			 * All devices of this class share devt 0, so
+			 * device_destroy() could remove the wrong one.
+			 */
+			device_unregister(device);
 			return err;
 		}
 	}
 
+	gi->dev = device;
+	mutex_lock(&android_device_lock);
+	if (!android_device)
+		android_device = device;
+	mutex_unlock(&android_device_lock);
+
 	return 0;
 }
 
-static void android_device_destroy(void)
+static void android_device_destroy(struct gadget_info *gi)
 {
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
 
+	if (IS_ERR_OR_NULL(gi->dev))
+		return;
+
+	cancel_work_sync(&gi->work);
+
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++))
-		device_remove_file(android_device, attr);
-	device_destroy(android_device->class, android_device->devt);
+		device_remove_file(gi->dev, attr);
+
+	mutex_lock(&android_device_lock);
+	if (android_device == gi->dev)
+		android_device = NULL;
+	mutex_unlock(&android_device_lock);
+
+	device_unregister(gi->dev);
+	gi->dev = NULL;
 }
 #else
 static inline int android_device_create(struct gadget_info *gi)
@@ -2197,7 +2456,7 @@ static inline int android_device_create(struct gadget_info *gi)
 	return 0;
 }
 
-static inline void android_device_destroy(void)
+static inline void android_device_destroy(struct gadget_info *gi)
 {
 }
 #endif
@@ -2207,6 +2466,7 @@ static struct config_group *gadgets_make(
 		const char *name)
 {
 	struct gadget_info *gi;
+	int ret = -ENOMEM;
 
 	gi = kzalloc(sizeof(*gi), GFP_KERNEL);
 	if (!gi)
@@ -2256,22 +2516,25 @@ static struct config_group *gadgets_make(
 	if (!gi->composite.gadget_driver.function)
 		goto err;
 
-	if (android_device_create(gi) < 0) {
+	ret = android_device_create(gi);
+	if (ret < 0) {
 		kfree(gi->composite.gadget_driver.function);
 		goto err;
-	}	
+	}
 
 	return &gi->group;
 
 err:
 	kfree(gi);
-	return ERR_PTR(-ENOMEM);
+	return ERR_PTR(ret);
 }
 
 static void gadgets_drop(struct config_group *group, struct config_item *item)
 {
+	struct gadget_info *gi = to_gadget_info(item);
+
+	android_device_destroy(gi);
 	config_item_put(item);
-	android_device_destroy();
 }
 
 static struct configfs_group_operations gadgets_ops = {
