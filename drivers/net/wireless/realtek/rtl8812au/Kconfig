@@ -1,9 +1,0 @@
-config 88XXAU
-	tristate "Realtek RTL8812AU/RTL8821AU/RTL8814AU USB WiFi (aircrack-ng driver)"
-	depends on USB && CFG80211
-	select WIRELESS_EXT
-	select WEXT_PRIV
-	help
-	  Out-of-tree driver from https://github.com/aircrack-ng/rtl8812au
-	  (branch v5.6.4.2) for Realtek 802.11ac USB adapters. It supports
-	  monitor mode and frame injection.
