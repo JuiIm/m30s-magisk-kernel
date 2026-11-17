@@ -1,5 +1,7 @@
 Firmware for external USB WiFi adapters, built into the kernel image through
-CONFIG_EXTRA_FIRMWARE (see arch/arm64/configs/magisk_defconfig).
+CONFIG_EXTRA_FIRMWARE (see arch/arm64/configs/magisk_defconfig). The drivers
+themselves are modules; the firmware stays in the image (about 190 kB) so it
+is found no matter which process probes the adapter.
 
 All files are unmodified copies from the linux-firmware repository, tag 20240115
 (https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git).
@@ -12,6 +14,3 @@ All files are unmodified copies from the linux-firmware repository, tag 20240115
       drivers rt2800usb, rt73usb             licence: LICENCE.ralink-firmware.txt
   mt7601u.bin
       driver mt7601u                         licence: LICENCE.ralink_a_mediatek_company_firmware
-  rtlwifi/rtl8192cufw_*.bin, rtlwifi/rtl8723aufw_*.bin,
-  rtlwifi/rtl8192eu_nic.bin, rtlwifi/rtl8723bu_nic.bin
-      driver rtl8xxxu                        licence: LICENCE.rtlwifi_firmware.txt
