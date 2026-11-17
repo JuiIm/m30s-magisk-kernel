@@ -1,0 +1,17 @@
+Firmware for external USB WiFi adapters, built into the kernel image through
+CONFIG_EXTRA_FIRMWARE (see arch/arm64/configs/magisk_defconfig).
+
+All files are unmodified copies from the linux-firmware repository, tag 20240115
+(https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git).
+
+  ath9k_htc/htc_9271-1.4.0.fw, ath9k_htc/htc_7010-1.4.0.fw
+      driver ath9k_htc (AR9271, AR7010)      licence: LICENCE.atheros_firmware
+  carl9170-1.fw
+      driver carl9170 (AR9170)               licence: GPLv2, source: carl9170fw in linux-firmware
+  rt2870.bin, rt73.bin
+      drivers rt2800usb, rt73usb             licence: LICENCE.ralink-firmware.txt
+  mt7601u.bin
+      driver mt7601u                         licence: LICENCE.ralink_a_mediatek_company_firmware
+  rtlwifi/rtl8192cufw_*.bin, rtlwifi/rtl8723aufw_*.bin,
+  rtlwifi/rtl8192eu_nic.bin, rtlwifi/rtl8723bu_nic.bin
+      driver rtl8xxxu                        licence: LICENCE.rtlwifi_firmware.txt
