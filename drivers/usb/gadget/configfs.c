@@ -1693,10 +1693,10 @@ static void android_work(struct work_struct *data)
 	bool status[3] = { false, false, false };
 	unsigned long flags;
 	bool uevent_sent = false;
-	if (!android_device && IS_ERR(android_device)) {
-		pr_info("usb: cannot send uevent because android_device not available \n");
+	if (IS_ERR_OR_NULL(gi->dev)) {
+		pr_info("usb: cannot send uevent because android device not available\n");
 		return;
-	}	
+	}
 	spin_lock_irqsave(&cdev->lock, flags);
 	if (cdev->config)
 		status[1] = true;
@@ -1711,7 +1711,7 @@ static void android_work(struct work_struct *data)
 	spin_unlock_irqrestore(&cdev->lock, flags);
 
 	if (status[0]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, connected);
 		pr_info("usb: %s: sent uevent %s\n", __func__, connected[0]);
 		uevent_sent = true;
@@ -1727,7 +1727,7 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[1]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, configured);
 		pr_info("usb: %s: sent uevent %s\n", __func__, configured[0]);
 		uevent_sent = true;
@@ -1737,7 +1737,7 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[2]) {
-		kobject_uevent_env(&android_device->kobj,
+		kobject_uevent_env(&gi->dev->kobj,
 					KOBJ_CHANGE, disconnected);
 		pr_info("usb: %s: sent uevent %s\n", __func__, disconnected[0]);
 		uevent_sent = true;
@@ -2145,51 +2145,77 @@ static struct device_attribute *android_usb_attributes[] = {
 	NULL
 };
 
+/*
+ * Every gadget gets its own device in /sys/class/android_usb.
+ *
+ * Samsung init and the Android framework expect the stock gadget (g1) at
+ * /sys/class/android_usb/android0, so g1 keeps that name. Any other gadget
+ * uses its own configfs name. The global android_device only tracks the
+ * first (primary) gadget; the Samsung function drivers hang their devices
+ * under it (see create_function_device()).
+ */
 static int android_device_create(struct gadget_info *gi)
 {
-	struct device *device;
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
-	char dev_name[10];
+	const char *name = gi->composite.name;
+	struct device *device;
 
-	snprintf(dev_name, sizeof(dev_name), "%s", gi->composite.name);
-
-	if (strcmp(dev_name, "g1") == 0)
-		snprintf(dev_name, sizeof(dev_name), "android0");
+	if (strcmp(name, "g1") == 0)
+		name = "android0";
 
 	INIT_WORK(&gi->work, android_work);
 	device = device_create(android_class, NULL,
-				MKDEV(0, 0), NULL, dev_name);
-	if (IS_ERR(device))
+				MKDEV(0, 0), NULL, "%s", name);
+	if (IS_ERR(device)) {
+		pr_err("usb: %s: cannot create android_usb/%s for gadget %s (%ld)\n",
+			__func__, name, gi->composite.name, PTR_ERR(device));
 		return PTR_ERR(device);
+	}
 
-	android_device = device;
-	dev_set_drvdata(android_device, gi);
+	dev_set_drvdata(device, gi);
 
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++)) {
 		int err;
 
-		err = device_create_file(android_device, attr);
+		err = device_create_file(device, attr);
 		if (err) {
-			device_destroy(android_device->class,
-				       android_device->devt);
+			/*
+			 * All devices of this class share devt 0, so
+			 * device_destroy() could remove the wrong one.
+			 */
+			device_unregister(device);
 			return err;
 		}
 	}
 
+	gi->dev = device;
+	if (!android_device)
+		android_device = device;
+
 	return 0;
 }
 
-static void android_device_destroy(void)
+static void android_device_destroy(struct gadget_info *gi)
 {
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
 
+	if (IS_ERR_OR_NULL(gi->dev))
+		return;
+
+	cancel_work_sync(&gi->work);
+
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++))
-		device_remove_file(android_device, attr);
-	device_destroy(android_device->class, android_device->devt);
+		device_remove_file(gi->dev, attr);
+
+	if (android_device == gi->dev)
+		android_device = NULL;
+
+	device_unregister(gi->dev);
+	gi->dev = NULL;
 }
 #else
 static inline int android_device_create(struct gadget_info *gi)
@@ -2197,7 +2223,7 @@ static inline int android_device_create(struct gadget_info *gi)
 	return 0;
 }
 
-static inline void android_device_destroy(void)
+static inline void android_device_destroy(struct gadget_info *gi)
 {
 }
 #endif
@@ -2207,6 +2233,7 @@ static struct config_group *gadgets_make(
 		const char *name)
 {
 	struct gadget_info *gi;
+	int ret = -ENOMEM;
 
 	gi = kzalloc(sizeof(*gi), GFP_KERNEL);
 	if (!gi)
@@ -2256,22 +2283,25 @@ static struct config_group *gadgets_make(
 	if (!gi->composite.gadget_driver.function)
 		goto err;
 
-	if (android_device_create(gi) < 0) {
+	ret = android_device_create(gi);
+	if (ret < 0) {
 		kfree(gi->composite.gadget_driver.function);
 		goto err;
-	}	
+	}
 
 	return &gi->group;
 
 err:
 	kfree(gi);
-	return ERR_PTR(-ENOMEM);
+	return ERR_PTR(ret);
 }
 
 static void gadgets_drop(struct config_group *group, struct config_item *item)
 {
+	struct gadget_info *gi = to_gadget_info(item);
+
+	android_device_destroy(gi);
 	config_item_put(item);
-	android_device_destroy();
 }
 
 static struct configfs_group_operations gadgets_ops = {
