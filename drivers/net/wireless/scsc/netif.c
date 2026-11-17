@@ -165,6 +165,17 @@ MODULE_PARM_DESC(monitor_inject, "Experimental frame injection on a monitor inte
 /* Injected frames the firmware refused in a row, see slsi_monitor_xmit() */
 static atomic_t slsi_monitor_tx_fails = ATOMIC_INIT(0);
 
+static bool monitor_mode;
+module_param(monitor_mode, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(monitor_mode, "Y: wlan0 becomes a monitor interface the next time it is brought up, without iw. N (default): wlan0 goes back to a normal station the next time it is brought up");
+
+static uint monitor_channel = 6;
+module_param(monitor_channel, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(monitor_channel, "Channel a monitor interface listens on when it is brought up (default 6)");
+
+/* wlan0 was switched to monitor by the monitor_mode parameter, not by nl80211 */
+static bool slsi_monitor_forced;
+
 #if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
 static void slsi_netif_tcp_ack_suppression_timeout(struct timer_list *t);
 #else
@@ -300,6 +311,57 @@ exit:
 	return ret;
 }
 
+/* Without iw there is no way to ask for a monitor interface, so the
+ * monitor_mode module parameter does it when wlan0 is brought up. The
+ * interface is down at this point and cfg80211 only counts it as running
+ * after ndo_open returns, so the type can be changed here.
+ */
+static void slsi_monitor_apply_param(struct net_device *dev)
+{
+	struct netdev_vif *ndev_vif = netdev_priv(dev);
+
+	if (!SLSI_IS_VIF_INDEX_WLAN(ndev_vif))
+		return;
+
+	if (monitor_mode && ndev_vif->iftype == NL80211_IFTYPE_STATION) {
+		ndev_vif->iftype = NL80211_IFTYPE_MONITOR;
+		dev->ieee80211_ptr->iftype = NL80211_IFTYPE_MONITOR;
+		slsi_monitor_forced = true;
+	} else if (!monitor_mode && slsi_monitor_forced) {
+		if (ndev_vif->iftype == NL80211_IFTYPE_MONITOR) {
+			ndev_vif->iftype = NL80211_IFTYPE_STATION;
+			dev->ieee80211_ptr->iftype = NL80211_IFTYPE_STATION;
+		}
+		slsi_monitor_forced = false;
+	}
+}
+
+/* The firmware gets no channel when a monitor VIF is added. Give it one, so
+ * the interface receives frames as soon as it is up. "iw dev wlan0 set
+ * channel" can change it later.
+ */
+static void slsi_monitor_set_default_channel(struct slsi_dev *sdev, struct net_device *dev)
+{
+	struct cfg80211_chan_def chandef;
+	struct ieee80211_channel *chan = NULL;
+	int                      freq;
+
+	freq = ieee80211_channel_to_frequency(monitor_channel,
+					      monitor_channel <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ);
+	if (freq)
+		chan = ieee80211_get_channel(sdev->wiphy, freq);
+	if (!chan) {
+		netdev_warn(dev, "monitor: channel %u is not supported, no channel set\n", monitor_channel);
+		return;
+	}
+
+	cfg80211_chandef_create(&chandef, chan, NL80211_CHAN_NO_HT);
+	if (slsi_test_sap_configure_monitor_mode(sdev, dev, &chandef))
+		netdev_warn(dev, "monitor: the firmware refused channel %u (%d MHz)\n", monitor_channel, freq);
+	else
+		netdev_info(dev, "monitor: listening on channel %u (%d MHz)\n", monitor_channel, freq);
+}
+
 /* Net Device callback operations */
 static int slsi_net_open(struct net_device *dev)
 {
@@ -408,9 +470,12 @@ static int slsi_net_open(struct net_device *dev)
 
 	reinit_completion(&ndev_vif->sig_wait.completion);
 
+	slsi_monitor_apply_param(dev);
+
 	if (ndev_vif->iftype == NL80211_IFTYPE_MONITOR) {
 		err = slsi_start_monitor_mode(sdev, dev);
-		if (WARN_ON(err)) {
+		if (err) {
+			netdev_err(dev, "monitor: the firmware refused to start a monitor interface (%d)\n", err);
 			SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
 			slsi_wake_unlock(&sdev->wlan_wl_init);
 			return err;
@@ -418,6 +483,7 @@ static int slsi_net_open(struct net_device *dev)
 		atomic_set(&slsi_monitor_tx_fails, 0);
 		netdev_info(dev, "monitor mode started (frame injection %s)\n",
 			    monitor_inject ? "on, experimental" : "off");
+		slsi_monitor_set_default_channel(sdev, dev);
 	}
 	SLSI_NET_INFO(dev, "ifnum:%d r:%d MAC:" MACSTR "\n", ndev_vif->ifnum, sdev->recovery_status, MAC2STR(dev->dev_addr));
 	ndev_vif->is_available = true;
