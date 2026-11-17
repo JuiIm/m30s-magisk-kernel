@@ -27,6 +27,8 @@ extern int terminal_ctrl_request(struct usb_composite_dev *cdev,
 #endif
 static struct class *android_class;
 static struct device *android_device;
+/* serializes changes of android_device and the UDC handover */
+static DEFINE_MUTEX(android_device_lock);
 static int index;
 
 struct device *create_function_device(char *name)
@@ -379,6 +381,65 @@ static void clear_current_usb_link(struct usb_composite_dev *cdev)
 	}
 }
 
+/* gi->lock must be held */
+static int gadget_release_udc(struct gadget_info *gi)
+{
+	int ret;
+
+	ret = unregister_gadget(gi);
+	if (ret)
+		return ret;
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	if (!list_empty(&gi->linked_func) && gi->symboliclink_change_mode) {
+		pr_info("usb: %s: GSI_image : Clear cfg->func_list\n", __func__);
+		clear_current_usb_link(&gi->cdev);
+	}
+#endif
+	return 0;
+}
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+/*
+ * This SoC has a single UDC and the stock Android gadget (android0, normally
+ * g1) owns it from boot. Unbinding g1 from userspace first leaves a window in
+ * which init can bind it again before the other gadget gets the UDC.
+ *
+ * So when another gadget asks for a UDC that the primary Android gadget
+ * holds, release it here, exactly like writing "none" to the primary
+ * gadget's UDC attribute. The caller then binds the UDC without a window.
+ * The primary gadget never takes a UDC this way: while another gadget holds
+ * it, writes to g1/UDC keep failing with -EBUSY.
+ *
+ * Called with gi->lock held. Returns 0 if the UDC was released.
+ */
+static int android_udc_handover(struct gadget_info *gi, const char *udc_name)
+{
+	struct gadget_info *primary;
+	const char *held;
+	int ret = -EBUSY;
+
+	mutex_lock(&android_device_lock);
+	if (IS_ERR_OR_NULL(android_device))
+		goto out;
+
+	primary = dev_get_drvdata(android_device);
+	if (!primary || primary == gi)
+		goto out;
+
+	mutex_lock_nested(&primary->lock, SINGLE_DEPTH_NESTING);
+	held = primary->composite.gadget_driver.udc_name;
+	if (held && !strcmp(held, udc_name)) {
+		pr_info("usb: %s: gadget %s takes UDC %s from %s\n", __func__,
+			gi->composite.name, udc_name, primary->composite.name);
+		ret = gadget_release_udc(primary);
+	}
+	mutex_unlock(&primary->lock);
+out:
+	mutex_unlock(&android_device_lock);
+	return ret;
+}
+#endif
+
 static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 		const char *page, size_t len)
 {
@@ -415,16 +476,10 @@ static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 	mutex_lock(&gi->lock);
 
 	if (!strlen(name) || strcmp(name, "none") == 0) {
-		ret = unregister_gadget(gi);
+		ret = gadget_release_udc(gi);
 		if (ret)
 			goto err;
 		kfree(name);
-#ifdef CONFIG_USB_CONFIGFS_UEVENT
-		if (!list_empty(&gi->linked_func) && gi->symboliclink_change_mode) {
-			pr_info("usb: %s: GSI_image : Clear cfg->func_list\n", __func__);
-			clear_current_usb_link(cdev);
-		}
-#endif
 	} else {
 		if (gi->composite.gadget_driver.udc_name) {
 			ret = -EBUSY;
@@ -432,6 +487,11 @@ static ssize_t gadget_dev_desc_UDC_store(struct config_item *item,
 		}
 		gi->composite.gadget_driver.udc_name = name;
 		ret = usb_gadget_probe_driver(&gi->composite.gadget_driver);
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+		if (ret == -EBUSY && !android_udc_handover(gi, name))
+			ret = usb_gadget_probe_driver(
+					&gi->composite.gadget_driver);
+#endif
 		if (ret) {
 			gi->composite.gadget_driver.udc_name = NULL;
 			goto err;
@@ -2191,8 +2251,10 @@ static int android_device_create(struct gadget_info *gi)
 	}
 
 	gi->dev = device;
+	mutex_lock(&android_device_lock);
 	if (!android_device)
 		android_device = device;
+	mutex_unlock(&android_device_lock);
 
 	return 0;
 }
@@ -2211,8 +2273,10 @@ static void android_device_destroy(struct gadget_info *gi)
 	while ((attr = *attrs++))
 		device_remove_file(gi->dev, attr);
 
+	mutex_lock(&android_device_lock);
 	if (android_device == gi->dev)
 		android_device = NULL;
+	mutex_unlock(&android_device_lock);
 
 	device_unregister(gi->dev);
 	gi->dev = NULL;
