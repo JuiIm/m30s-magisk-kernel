@@ -9,10 +9,6 @@
 #include <linux/rtnetlink.h>
 #include <net/sch_generic.h>
 #include <linux/if_ether.h>
-#include <linux/ieee80211.h>
-#include <linux/workqueue.h>
-#include <asm/unaligned.h>
-#include <net/ieee80211_radiotap.h>
 #include <scsc/scsc_logring.h>
 
 #include "debug.h"
@@ -157,13 +153,6 @@ MODULE_PARM_DESC(tcp_ack_suppression_rcv_window, "Receive window size (in unit o
 static bool tcp_ack_suppression_delay_acks_suppress;
 module_param(tcp_ack_suppression_delay_acks_suppress, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(tcp_ack_suppression_delay_acks_suppress, "0: do not suppress delay Acks (default), 1: delay Acks can be suppressed");
-
-static bool monitor_inject = true;
-module_param(monitor_inject, bool, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(monitor_inject, "Experimental frame injection on a monitor interface: Y: frames written to the interface are passed to the firmware (default), N: they are dropped");
-
-/* Injected frames the firmware refused in a row, see slsi_monitor_xmit() */
-static atomic_t slsi_monitor_tx_fails = ATOMIC_INIT(0);
 
 #if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
 static void slsi_netif_tcp_ack_suppression_timeout(struct timer_list *t);
@@ -415,9 +404,6 @@ static int slsi_net_open(struct net_device *dev)
 			slsi_wake_unlock(&sdev->wlan_wl_init);
 			return err;
 		}
-		atomic_set(&slsi_monitor_tx_fails, 0);
-		netdev_info(dev, "monitor mode started (frame injection %s)\n",
-			    monitor_inject ? "on, experimental" : "off");
 	}
 	SLSI_NET_INFO(dev, "ifnum:%d r:%d MAC:" MACSTR "\n", ndev_vif->ifnum, sdev->recovery_status, MAC2STR(dev->dev_addr));
 	ndev_vif->is_available = true;
@@ -788,12 +774,6 @@ static u16 slsi_net_select_queue(struct net_device *dev, struct sk_buff *skb, vo
 #endif
 	SLSI_NET_DBG4(dev, SLSI_NETDEV, "\n");
 
-	/* A monitor interface carries radiotap frames: there is no Ethernet
-	 * header to classify. Any queue will do, slsi_monitor_xmit() takes it.
-	 */
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR)
-		return SLSI_NETIF_Q_PRIORITY;
-
 	/* Defensive check for uninitialized mac header */
 	if (!skb_mac_header_was_set(skb))
 		skb_reset_mac_header(skb);
@@ -1053,109 +1033,6 @@ void slsi_tdls_move_packets(struct slsi_dev *sdev, struct net_device *dev,
 	slsi_tx_unpause_queues(sdev);
 }
 
-/* Frame injection on a monitor interface (experimental).
- *
- * A frame written to a monitor interface (raw packet socket) starts with a
- * radiotap header followed by a complete 802.11 frame. The data path cannot
- * carry it: it only takes Ethernet frames for a connected peer. The only
- * firmware primitive that takes a raw 802.11 frame is MLME-SEND-FRAME, which
- * blocks until the firmware confirms, so the frame is handed to a work item.
- *
- * Whether the firmware sends such a frame from a monitor VIF is not known. If
- * it keeps rejecting them, injection is switched off until the interface is
- * opened again, so a tool that floods frames does not hammer the firmware.
- */
-#define SLSI_MONITOR_TX_QUEUE_MAX	64
-#define SLSI_MONITOR_TX_FAIL_MAX	8
-#define SLSI_MONITOR_TX_MIN_FRAME_LEN	10	/* frame control, duration, address 1 */
-
-static struct sk_buff_head slsi_monitor_tx_queue = {
-	.next = (struct sk_buff *)&slsi_monitor_tx_queue,
-	.prev = (struct sk_buff *)&slsi_monitor_tx_queue,
-	.lock = __SPIN_LOCK_UNLOCKED(slsi_monitor_tx_queue.lock),
-};
-
-static void slsi_monitor_tx_work_fn(struct work_struct *work)
-{
-	struct sk_buff *skb;
-
-	while ((skb = skb_dequeue(&slsi_monitor_tx_queue))) {
-		struct net_device    *dev = skb->dev;
-		struct netdev_vif    *ndev_vif = netdev_priv(dev);
-		struct slsi_dev      *sdev = ndev_vif->sdev;
-		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
-		u16                  msg_type = FAPI_MESSAGETYPE_ANY_OTHER;
-		int                  r = -ENETDOWN;
-
-		if (ieee80211_is_action(hdr->frame_control))
-			msg_type = FAPI_MESSAGETYPE_IEEE80211_ACTION;
-		else if (ieee80211_is_mgmt(hdr->frame_control))
-			msg_type = FAPI_MESSAGETYPE_IEEE80211_MGMT;
-
-		SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-		if (ndev_vif->is_available && ndev_vif->activated &&
-		    ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR &&
-		    atomic_read(&slsi_monitor_tx_fails) < SLSI_MONITOR_TX_FAIL_MAX)
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, skb->data, skb->len,
-						      FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
-						      msg_type, slsi_tx_mgmt_host_tag(sdev), 0, 0, 0);
-		SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-
-		if (!r) {
-			atomic_set(&slsi_monitor_tx_fails, 0);
-			ndev_vif->stats.tx_packets++;
-			ndev_vif->stats.tx_bytes += skb->len;
-		} else {
-			ndev_vif->stats.tx_dropped++;
-			if (r != -ENETDOWN &&
-			    atomic_inc_return(&slsi_monitor_tx_fails) == SLSI_MONITOR_TX_FAIL_MAX)
-				netdev_warn(dev, "monitor: firmware refused %d injected frames in a row (last error %d, frame control 0x%04x); injection is off until the interface is opened again\n",
-					    SLSI_MONITOR_TX_FAIL_MAX, r, le16_to_cpu(hdr->frame_control));
-		}
-
-		dev_put(dev);
-		kfree_skb(skb);
-	}
-}
-
-static DECLARE_WORK(slsi_monitor_tx_work, slsi_monitor_tx_work_fn);
-
-static netdev_tx_t slsi_monitor_xmit(struct sk_buff *skb, struct net_device *dev)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	u16               rtap_len;
-
-	if (!monitor_inject ||
-	    atomic_read(&slsi_monitor_tx_fails) >= SLSI_MONITOR_TX_FAIL_MAX ||
-	    skb_queue_len(&slsi_monitor_tx_queue) >= SLSI_MONITOR_TX_QUEUE_MAX)
-		goto drop;
-
-	if (skb_linearize(skb))
-		goto drop;
-
-	if (skb->len < sizeof(struct ieee80211_radiotap_header))
-		goto drop;
-	if (((struct ieee80211_radiotap_header *)skb->data)->it_version)
-		goto drop;
-	rtap_len = get_unaligned_le16(&((struct ieee80211_radiotap_header *)skb->data)->it_len);
-	if (rtap_len < sizeof(struct ieee80211_radiotap_header) ||
-	    skb->len < rtap_len + SLSI_MONITOR_TX_MIN_FRAME_LEN ||
-	    skb->len > rtap_len + IEEE80211_MAX_FRAME_LEN)
-		goto drop;
-	skb_pull(skb, rtap_len);
-
-	dev_hold(dev);
-	skb->dev = dev;
-	skb_queue_tail(&slsi_monitor_tx_queue, skb);
-	schedule_work(&slsi_monitor_tx_work);
-	return NETDEV_TX_OK;
-
-drop:
-	ndev_vif->stats.tx_dropped++;
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
-}
-
 /**
  * This is the main TX entry point for the driver.
  *
@@ -1207,10 +1084,6 @@ static netdev_tx_t slsi_net_hw_xmit(struct sk_buff *skb, struct net_device *dev)
 	 */
 	unsigned int packet_len = skb->len;
 	enum slsi_traffic_q traffic_q = slsi_frame_priority_to_ac_queue(skb->priority);
-
-	/* A monitor interface carries radiotap frames, not Ethernet frames */
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_MONITOR)
-		return slsi_monitor_xmit(skb, dev);
 
 	slsi_wake_lock(&sdev->wlan_wl);
 	slsi_skb_cb_init(skb);
