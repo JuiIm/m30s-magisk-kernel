@@ -6,6 +6,16 @@ config SCSC_BT_BLUEZ
 	default N
         tristate "SCSC MX BlueZ support"
         depends on SCSC_CORE
+	depends on BT
+	---help---
+	  Lets the Linux Bluetooth stack (BlueZ) use the built-in Bluetooth
+	  chip as an HCI device, for tools such as hciconfig, hcitool and
+	  btmon. Nothing happens until it is switched on by hand:
+
+	    echo 1 > /sys/module/scsc_bt/parameters/power_control
+
+	  The chip has one user at a time: Android Bluetooth must be off
+	  while the HCI device is up, and the other way round.
 
 config SCSC_ANT
 	default Y

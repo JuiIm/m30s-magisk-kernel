@@ -7,6 +7,7 @@
  ****************************************************************************/
 
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -49,8 +50,18 @@ static struct file			s_file;
 static struct platform_device *slsi_btz_pdev;
 static struct rfkill *btz_rfkill;
 
+/* Register the HCI device as a raw device: the kernel then sends no HCI
+ * commands of its own when the device is brought up, and only raw / user
+ * channel sockets can use it. For the case that the normal bring-up fails.
+ */
+static bool raw_device;
+module_param(raw_device, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(raw_device,
+		 "Register the BlueZ HCI device as a raw device (takes effect the next time power_control is set to 1)");
+
 static const struct h4_recv_pkt scsc_recv_pkts[] = {
 	{ H4_RECV_ACL,   .recv = hci_recv_frame },
+	{ H4_RECV_SCO,   .recv = hci_recv_frame },
 	{ H4_RECV_EVENT, .recv = hci_recv_frame },
 };
 
@@ -71,11 +82,22 @@ static void slsi_bt_fs_read_func(struct work_struct *work)
 			if (IS_ERR(skb)) {
 				SCSC_TAG_ERR(BT_COMMON, "corrupted event packet\n");
 				hdev->stat.err_rx++;
+				skb = NULL;
 				break;
 			}
 			hdev->stat.byte_rx += ret;
+		} else if (error_count_ref != NULL && atomic_read(error_count_ref) != 0) {
+			/* Nothing was read and the service is in an error state:
+			 * read() would return at once every time, so stop here
+			 * instead of spinning.
+			 */
+			break;
 		}
 	}
+
+	/* A packet that was only partly received */
+	if (skb)
+		kfree_skb(skb);
 
 	SCSC_TAG_INFO(BT_COMMON, "BT BlueZ: Exiting %s\n", __func__);
 }
@@ -147,9 +169,7 @@ static int slsi_bt_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 
 	ret = bt_fs->write(NULL, skb->data, skb->len, NULL);
 	if (ret >= 0) {
-		kfree_skb(skb);
-
-		/* Update HCI stat counters */
+		/* Update HCI stat counters (before the skb is freed) */
 		hdev->stat.byte_tx += skb->len;
 
 		switch (hci_skb_pkt_type(skb)) {
@@ -165,6 +185,11 @@ static int slsi_bt_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 				hdev->stat.sco_tx++;
 				break;
 		}
+
+		kfree_skb(skb);
+
+		/* The HCI core expects 0 for "sent", not a byte count */
+		ret = 0;
 	}
 
 	return ret;
@@ -182,7 +207,10 @@ static void slsi_bt_open_worker(struct work_struct *work)
 		}
 
 		hdev->bus = HCI_VIRTUAL;
-		hdev->dev_type = HCI_BREDR;
+		/* HCI_BREDR was renamed to HCI_PRIMARY in Linux 4.8 */
+		hdev->dev_type = HCI_PRIMARY;
+		if (raw_device)
+			set_bit(HCI_QUIRK_RAW_DEVICE, &hdev->quirks);
 
 		SET_HCIDEV_DEV(hdev, dev_ref);
 
