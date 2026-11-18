@@ -13,6 +13,7 @@
 #include <linux/workqueue.h>
 #include <asm/unaligned.h>
 #include <net/ieee80211_radiotap.h>
+#include <net/cfg80211.h>
 #include <scsc/scsc_logring.h>
 
 #include "debug.h"
@@ -175,6 +176,19 @@ MODULE_PARM_DESC(monitor_channel, "Channel a monitor interface listens on when i
 
 /* wlan0 was switched to monitor by the monitor_mode parameter, not by nl80211 */
 static bool slsi_monitor_forced;
+
+/* Read-only counters for the injection path, to check it from a shell */
+static uint monitor_tx_sent;
+module_param(monitor_tx_sent, uint, S_IRUGO);
+MODULE_PARM_DESC(monitor_tx_sent, "Injected frames the firmware accepted");
+
+static uint monitor_tx_refused;
+module_param(monitor_tx_refused, uint, S_IRUGO);
+MODULE_PARM_DESC(monitor_tx_refused, "Injected frames the firmware refused");
+
+static uint monitor_tx_dropped;
+module_param(monitor_tx_dropped, uint, S_IRUGO);
+MODULE_PARM_DESC(monitor_tx_dropped, "Injected frames dropped before they reached the firmware (bad radiotap header, queue full, injection off)");
 
 #if KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE
 static void slsi_netif_tcp_ack_suppression_timeout(struct timer_list *t);
@@ -1169,9 +1183,14 @@ static void slsi_monitor_tx_work_fn(struct work_struct *work)
 
 		if (!r) {
 			atomic_set(&slsi_monitor_tx_fails, 0);
+			monitor_tx_sent++;
 			ndev_vif->stats.tx_packets++;
 			ndev_vif->stats.tx_bytes += skb->len;
 		} else {
+			if (r == -ENETDOWN)
+				monitor_tx_dropped++;
+			else
+				monitor_tx_refused++;
 			ndev_vif->stats.tx_dropped++;
 			if (r != -ENETDOWN &&
 			    atomic_inc_return(&slsi_monitor_tx_fails) == SLSI_MONITOR_TX_FAIL_MAX)
@@ -1188,8 +1207,10 @@ static DECLARE_WORK(slsi_monitor_tx_work, slsi_monitor_tx_work_fn);
 
 static netdev_tx_t slsi_monitor_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	u16               rtap_len;
+	struct netdev_vif                 *ndev_vif = netdev_priv(dev);
+	struct ieee80211_radiotap_iterator it;
+	bool                              has_fcs = false;
+	u16                               rtap_len;
 
 	if (!monitor_inject ||
 	    atomic_read(&slsi_monitor_tx_fails) >= SLSI_MONITOR_TX_FAIL_MAX ||
@@ -1199,16 +1220,24 @@ static netdev_tx_t slsi_monitor_xmit(struct sk_buff *skb, struct net_device *dev
 	if (skb_linearize(skb))
 		goto drop;
 
-	if (skb->len < sizeof(struct ieee80211_radiotap_header))
+	/* The iterator checks version, length and the present bitmaps */
+	if (skb->len < sizeof(struct ieee80211_radiotap_header) ||
+	    ieee80211_radiotap_iterator_init(&it, (struct ieee80211_radiotap_header *)skb->data,
+					     skb->len, NULL))
 		goto drop;
-	if (((struct ieee80211_radiotap_header *)skb->data)->it_version)
-		goto drop;
+	while (!ieee80211_radiotap_iterator_next(&it)) {
+		/* Some tools append the FCS and say so; the firmware adds its own */
+		if (it.this_arg_index == IEEE80211_RADIOTAP_FLAGS &&
+		    (*it.this_arg & IEEE80211_RADIOTAP_F_FCS))
+			has_fcs = true;
+	}
 	rtap_len = get_unaligned_le16(&((struct ieee80211_radiotap_header *)skb->data)->it_len);
-	if (rtap_len < sizeof(struct ieee80211_radiotap_header) ||
-	    skb->len < rtap_len + SLSI_MONITOR_TX_MIN_FRAME_LEN ||
+	if (skb->len < rtap_len + SLSI_MONITOR_TX_MIN_FRAME_LEN + (has_fcs ? FCS_LEN : 0) ||
 	    skb->len > rtap_len + IEEE80211_MAX_FRAME_LEN)
 		goto drop;
 	skb_pull(skb, rtap_len);
+	if (has_fcs)
+		skb_trim(skb, skb->len - FCS_LEN);
 
 	dev_hold(dev);
 	skb->dev = dev;
@@ -1217,6 +1246,7 @@ static netdev_tx_t slsi_monitor_xmit(struct sk_buff *skb, struct net_device *dev
 	return NETDEV_TX_OK;
 
 drop:
+	monitor_tx_dropped++;
 	ndev_vif->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;

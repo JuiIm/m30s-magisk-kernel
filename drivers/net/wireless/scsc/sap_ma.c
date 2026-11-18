@@ -4,6 +4,9 @@
  *
  ****************************************************************************/
 #include <linux/types.h>
+#include <linux/if_ether.h>
+#include <asm/unaligned.h>
+#include <net/ieee80211_radiotap.h>
 #include "debug.h"
 #include "dev.h"
 #include "sap.h"
@@ -641,6 +644,54 @@ void slsi_rx_data_deliver_skb(struct slsi_dev *sdev, struct net_device *dev, str
 	}
 }
 
+/* The monitor netdev is declared as ARPHRD_IEEE80211_RADIOTAP, so every frame
+ * handed to the stack must start with a radiotap header. Whether the firmware
+ * puts one in front of the 802.11 frame is not documented, so look at the
+ * frame: a radiotap header starts with version 0, pad 0 and a length that
+ * fits, and an 802.11 header (protocol version 0) follows it.
+ */
+static bool slsi_monitor_frame_has_radiotap(const struct sk_buff *skb)
+{
+	const struct ieee80211_radiotap_header *rt = (const void *)skb->data;
+	u16                                    rt_len;
+
+	if (skb->len < sizeof(*rt) + 10)
+		return false;
+	if (rt->it_version || rt->it_pad)
+		return false;
+	rt_len = get_unaligned_le16(&rt->it_len);
+	if (rt_len < sizeof(*rt) || rt_len + 10 > skb->len)
+		return false;
+	return (skb->data[rt_len] & 0x03) == 0;
+}
+
+/* Returns false if the frame had to be dropped */
+static bool slsi_monitor_fix_radiotap(struct net_device *dev, struct sk_buff *skb)
+{
+	static const u8 empty_radiotap[sizeof(struct ieee80211_radiotap_header)] = {
+		0, 0, sizeof(struct ieee80211_radiotap_header), 0, 0, 0, 0, 0
+	};
+	static bool     said_with, said_without;
+
+	if (slsi_monitor_frame_has_radiotap(skb)) {
+		if (!said_with) {
+			said_with = true;
+			netdev_info(dev, "monitor: the firmware delivers frames with a radiotap header\n");
+		}
+		return true;
+	}
+
+	if (!said_without) {
+		said_without = true;
+		netdev_info(dev, "monitor: the firmware delivers frames without a radiotap header, adding an empty one\n");
+	}
+	if (skb_headroom(skb) < sizeof(empty_radiotap) &&
+	    pskb_expand_head(skb, sizeof(empty_radiotap), 0, GFP_ATOMIC))
+		return false;
+	memcpy(skb_push(skb, sizeof(empty_radiotap)), empty_radiotap, sizeof(empty_radiotap));
+	return true;
+}
+
 static void slsi_rx_data_ind(struct slsi_dev *sdev, struct net_device *dev, struct sk_buff *skb)
 {
 	struct netdev_vif *ndev_vif = netdev_priv(dev);
@@ -680,10 +731,15 @@ static void slsi_rx_data_ind(struct slsi_dev *sdev, struct net_device *dev, stru
 		/* Populate wake reason stats here */
 		if (unlikely(slsi_skb_cb_get(skb)->wakeup))
 			slsi_rx_update_wake_stats(sdev, (struct ethhdr *)(skb->data), skb->len);
+		if (!slsi_monitor_fix_radiotap(dev, skb)) {
+			kfree_skb(skb);
+			return;
+		}
 		skb_reset_mac_header(skb);
 		skb->dev = dev;
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 		skb->pkt_type = PACKET_OTHERHOST;
+		skb->protocol = htons(ETH_P_802_2);
 		netif_rx_ni(skb);
 		return;
 	}
