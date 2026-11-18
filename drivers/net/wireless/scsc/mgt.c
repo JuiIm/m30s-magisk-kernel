@@ -597,6 +597,7 @@ void slsi_stop_monitor_mode(struct slsi_dev *sdev, struct net_device *dev)
 
 	/* set back to ARPHRD_ETHER */
 	dev->type = ARPHRD_ETHER;
+	ndev_vif->monitor_freq = 0;
 
 	slsi_vif_deactivated(sdev, dev);
 }

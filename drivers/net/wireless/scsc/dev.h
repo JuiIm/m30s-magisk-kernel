@@ -975,6 +975,8 @@ struct netdev_vif {
 	bool drv_in_p2p_procedure;
 	struct cfg80211_chan_def    *chandef;
 	struct cfg80211_chan_def    chandef_saved;
+	/* Frequency (MHz) a monitor VIF was last tuned to, 0 if none */
+	u16                         monitor_freq;
 
 	/* NOTE: The Address is a __be32
 	 * It needs converting to pass to the FW

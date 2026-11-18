@@ -668,10 +668,12 @@ static bool slsi_monitor_frame_has_radiotap(const struct sk_buff *skb)
 /* Returns false if the frame had to be dropped */
 static bool slsi_monitor_fix_radiotap(struct net_device *dev, struct sk_buff *skb)
 {
-	static const u8 empty_radiotap[sizeof(struct ieee80211_radiotap_header)] = {
-		0, 0, sizeof(struct ieee80211_radiotap_header), 0, 0, 0, 0, 0
-	};
-	static bool     said_with, said_without;
+	struct netdev_vif *ndev_vif = netdev_priv(dev);
+	static bool       said_with, said_without;
+	u16               freq = ndev_vif->monitor_freq;
+	/* header (8) + channel field (frequency, flags) when the channel is known */
+	u8                rt[12] = { 0 };
+	unsigned int      rt_len = freq ? 12 : 8;
 
 	if (slsi_monitor_frame_has_radiotap(skb)) {
 		if (!said_with) {
@@ -683,12 +685,21 @@ static bool slsi_monitor_fix_radiotap(struct net_device *dev, struct sk_buff *sk
 
 	if (!said_without) {
 		said_without = true;
-		netdev_info(dev, "monitor: the firmware delivers frames without a radiotap header, adding an empty one\n");
+		netdev_info(dev, "monitor: the firmware delivers frames without a radiotap header, adding one\n");
 	}
-	if (skb_headroom(skb) < sizeof(empty_radiotap) &&
-	    pskb_expand_head(skb, sizeof(empty_radiotap), 0, GFP_ATOMIC))
+
+	rt[2] = rt_len;
+	if (freq) {
+		u16 flags = freq < 3000 ? 0x0080 : 0x0100;	/* 2 GHz : 5 GHz */
+
+		rt[4] = BIT(IEEE80211_RADIOTAP_CHANNEL);
+		put_unaligned_le16(freq, &rt[8]);
+		put_unaligned_le16(flags, &rt[10]);
+	}
+
+	if (skb_headroom(skb) < rt_len && pskb_expand_head(skb, rt_len, 0, GFP_ATOMIC))
 		return false;
-	memcpy(skb_push(skb, sizeof(empty_radiotap)), empty_radiotap, sizeof(empty_radiotap));
+	memcpy(skb_push(skb, rt_len), rt, rt_len);
 	return true;
 }
 

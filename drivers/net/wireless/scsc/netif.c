@@ -171,8 +171,26 @@ module_param(monitor_mode, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(monitor_mode, "Y: wlan0 becomes a monitor interface the next time it is brought up, without iw. N (default): wlan0 goes back to a normal station the next time it is brought up");
 
 static uint monitor_channel = 6;
-module_param(monitor_channel, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(monitor_channel, "Channel a monitor interface listens on when it is brought up (default 6)");
+static int monitor_channel_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops monitor_channel_ops = {
+	.set = monitor_channel_set,
+	.get = param_get_uint,
+};
+module_param_cb(monitor_channel, &monitor_channel_ops, &monitor_channel, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(monitor_channel, "Channel a monitor interface listens on (default 6). Writing it retunes a running monitor interface at once");
+
+static uint monitor_hop_ms;
+static int monitor_hop_ms_set(const char *val, const struct kernel_param *kp);
+static const struct kernel_param_ops monitor_hop_ms_ops = {
+	.set = monitor_hop_ms_set,
+	.get = param_get_uint,
+};
+module_param_cb(monitor_hop_ms, &monitor_hop_ms_ops, &monitor_hop_ms, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(monitor_hop_ms, "Channel hopping for a monitor interface: time on each channel in ms (minimum 50), 0 = off (default)");
+
+static bool monitor_hop_5g;
+module_param(monitor_hop_5g, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(monitor_hop_5g, "Channel hopping also covers the 5 GHz channels (default N: 2.4 GHz only)");
 
 /* wlan0 was switched to monitor by the monitor_mode parameter, not by nl80211 */
 static bool slsi_monitor_forced;
@@ -350,30 +368,166 @@ static void slsi_monitor_apply_param(struct net_device *dev)
 	}
 }
 
-/* The firmware gets no channel when a monitor VIF is added. Give it one, so
- * the interface receives frames as soon as it is up. "iw dev wlan0 set
- * channel" can change it later.
+/* The running monitor interface, NULL if there is none. Only touched with the
+ * rtnl lock held (ndo_open and ndo_stop are called with it).
  */
-static void slsi_monitor_set_default_channel(struct slsi_dev *sdev, struct net_device *dev)
+static struct net_device *slsi_monitor_dev;
+static unsigned int      slsi_monitor_hop_index;
+
+static void slsi_monitor_hop_work_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(slsi_monitor_hop_work, slsi_monitor_hop_work_fn);
+
+/* Tune a monitor VIF to a channel number. The caller holds the vif_mutex. */
+static int slsi_monitor_tune_locked(struct slsi_dev *sdev, struct net_device *dev, uint channel, bool quiet)
 {
+	struct netdev_vif        *ndev_vif = netdev_priv(dev);
 	struct cfg80211_chan_def chandef;
 	struct ieee80211_channel *chan = NULL;
 	int                      freq;
+	int                      r;
 
-	freq = ieee80211_channel_to_frequency(monitor_channel,
-					      monitor_channel <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ);
+	if (!ndev_vif->activated || ndev_vif->vif_type != FAPI_VIFTYPE_MONITOR)
+		return -ENETDOWN;
+
+	freq = ieee80211_channel_to_frequency(channel, channel <= 14 ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ);
 	if (freq)
 		chan = ieee80211_get_channel(sdev->wiphy, freq);
-	if (!chan) {
-		netdev_warn(dev, "monitor: channel %u is not supported, no channel set\n", monitor_channel);
-		return;
+	if (!chan || (chan->flags & IEEE80211_CHAN_DISABLED)) {
+		if (!quiet)
+			netdev_warn(dev, "monitor: channel %u is not supported\n", channel);
+		return -EINVAL;
 	}
 
 	cfg80211_chandef_create(&chandef, chan, NL80211_CHAN_NO_HT);
-	if (slsi_test_sap_configure_monitor_mode(sdev, dev, &chandef))
-		netdev_warn(dev, "monitor: the firmware refused channel %u (%d MHz)\n", monitor_channel, freq);
+	r = slsi_test_sap_configure_monitor_mode(sdev, dev, &chandef);
+	if (quiet)
+		return r;
+	if (r)
+		netdev_warn(dev, "monitor: the firmware refused channel %u (%d MHz)\n", channel, freq);
 	else
-		netdev_info(dev, "monitor: listening on channel %u (%d MHz)\n", monitor_channel, freq);
+		netdev_info(dev, "monitor: listening on channel %u (%d MHz)\n", channel, freq);
+	return r;
+}
+
+/* Same, for callers that hold the rtnl lock but not the vif_mutex */
+static int slsi_monitor_tune(struct net_device *dev, uint channel, bool quiet)
+{
+	struct netdev_vif *ndev_vif = netdev_priv(dev);
+	int               r;
+
+	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
+	r = slsi_monitor_tune_locked(ndev_vif->sdev, dev, channel, quiet);
+	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
+	return r;
+}
+
+/* echo 11 > /sys/module/scsc_wlan/parameters/monitor_channel */
+static int monitor_channel_set(const char *val, const struct kernel_param *kp)
+{
+	uint channel;
+	int  r = kstrtouint(val, 0, &channel);
+
+	if (r)
+		return r;
+	if (!channel || channel > 196)
+		return -EINVAL;
+
+	monitor_channel = channel;
+
+	rtnl_lock();
+	if (slsi_monitor_dev)
+		r = slsi_monitor_tune(slsi_monitor_dev, channel, false);
+	rtnl_unlock();
+
+	/* no monitor interface is up: the value is used when one comes up */
+	return r == -ENETDOWN ? 0 : r;
+}
+
+/* Channel hopping. The list is every usable 2.4 GHz channel of the chip, plus
+ * the 5 GHz ones when monitor_hop_5g is set.
+ */
+static struct ieee80211_channel *slsi_monitor_hop_next(struct slsi_dev *sdev)
+{
+	struct ieee80211_supported_band *b2 = sdev->wiphy->bands[NL80211_BAND_2GHZ];
+	struct ieee80211_supported_band *b5 = monitor_hop_5g ? sdev->wiphy->bands[NL80211_BAND_5GHZ] : NULL;
+	unsigned int                    n2 = b2 ? b2->n_channels : 0;
+	unsigned int                    n5 = b5 ? b5->n_channels : 0;
+	unsigned int                    total = n2 + n5;
+	unsigned int                    tries;
+
+	for (tries = 0; tries < total; tries++) {
+		unsigned int             i = slsi_monitor_hop_index++ % total;
+		struct ieee80211_channel *chan = i < n2 ? &b2->channels[i] : &b5->channels[i - n2];
+
+		if (!(chan->flags & IEEE80211_CHAN_DISABLED))
+			return chan;
+	}
+	return NULL;
+}
+
+static void slsi_monitor_hop_work_fn(struct work_struct *work)
+{
+	struct net_device *dev;
+	uint              ms = monitor_hop_ms;
+
+	if (!ms)
+		return;
+
+	/* ndo_stop waits for this work with the rtnl lock held: never block on it */
+	if (!rtnl_trylock()) {
+		schedule_delayed_work(&slsi_monitor_hop_work, msecs_to_jiffies(20));
+		return;
+	}
+	dev = slsi_monitor_dev;
+	if (dev) {
+		struct netdev_vif        *ndev_vif = netdev_priv(dev);
+		struct ieee80211_channel *chan = slsi_monitor_hop_next(ndev_vif->sdev);
+
+		if (chan)
+			slsi_monitor_tune(dev, ieee80211_frequency_to_channel(chan->center_freq), true);
+	}
+	rtnl_unlock();
+
+	if (dev)
+		schedule_delayed_work(&slsi_monitor_hop_work, msecs_to_jiffies(max_t(uint, ms, 50)));
+}
+
+/* echo 250 > /sys/module/scsc_wlan/parameters/monitor_hop_ms   (0 stops it) */
+static int monitor_hop_ms_set(const char *val, const struct kernel_param *kp)
+{
+	uint ms;
+	int  r = kstrtouint(val, 0, &ms);
+
+	if (r)
+		return r;
+
+	monitor_hop_ms = ms;
+	if (ms)
+		mod_delayed_work(system_wq, &slsi_monitor_hop_work, 0);
+	else
+		cancel_delayed_work(&slsi_monitor_hop_work);
+	return 0;
+}
+
+/* A monitor interface came up (rtnl and vif_mutex held). The firmware gets no
+ * channel when a monitor VIF is added, so give it one; then start hopping if
+ * that is switched on.
+ */
+static void slsi_monitor_started(struct slsi_dev *sdev, struct net_device *dev)
+{
+	slsi_monitor_tune_locked(sdev, dev, monitor_channel, false);
+	slsi_monitor_dev = dev;
+	if (monitor_hop_ms)
+		mod_delayed_work(system_wq, &slsi_monitor_hop_work, msecs_to_jiffies(max_t(uint, monitor_hop_ms, 50)));
+}
+
+/* The interface goes down (rtnl held) */
+static void slsi_monitor_stopping(struct net_device *dev)
+{
+	if (slsi_monitor_dev != dev)
+		return;
+	slsi_monitor_dev = NULL;
+	cancel_delayed_work_sync(&slsi_monitor_hop_work);
 }
 
 /* Net Device callback operations */
@@ -497,7 +651,7 @@ static int slsi_net_open(struct net_device *dev)
 		atomic_set(&slsi_monitor_tx_fails, 0);
 		netdev_info(dev, "monitor mode started (frame injection %s)\n",
 			    monitor_inject ? "on, experimental" : "off");
-		slsi_monitor_set_default_channel(sdev, dev);
+		slsi_monitor_started(sdev, dev);
 	}
 	SLSI_NET_INFO(dev, "ifnum:%d r:%d MAC:" MACSTR "\n", ndev_vif->ifnum, sdev->recovery_status, MAC2STR(dev->dev_addr));
 	ndev_vif->is_available = true;
@@ -530,6 +684,8 @@ static int slsi_net_stop(struct net_device *dev)
 	struct netdev_vif *ndev_vif = netdev_priv(dev);
 	struct slsi_dev   *sdev = ndev_vif->sdev;
 	int r = 0;
+
+	slsi_monitor_stopping(dev);
 
 	if (sdev->recovery_fail_safe) {
 		r = wait_for_completion_timeout(&sdev->recovery_fail_safe_complete,

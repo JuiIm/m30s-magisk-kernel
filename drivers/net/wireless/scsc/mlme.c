@@ -4878,6 +4878,8 @@ int slsi_test_sap_configure_monitor_mode(struct slsi_dev *sdev, struct net_devic
 		SLSI_NET_ERR(dev, "test_configure_monitor_mode_cfm(result:0x%04x) ERROR\n",
 			     fapi_get_u16(cfm, u.test_configure_monitor_mode_cfm.result_code));
 		r = -EINVAL;
+	} else {
+		ndev_vif->monitor_freq = chandef->chan->center_freq;
 	}
 
 	kfree_skb(cfm);
