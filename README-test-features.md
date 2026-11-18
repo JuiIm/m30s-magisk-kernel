@@ -99,6 +99,8 @@ In `pentest-features`:
 
 - `rtl8xxxu` is back, with RTL8188EU support (TP-Link TL-WN722N v2/v3) from
   the Kali NetHunter patch set.
+- `88x2bu`: Realtek RTL8812BU / RTL8822BU 802.11ac adapters, from the RinCat
+  vendor driver (monitor mode and injection).
 - mac80211 has the NetHunter injection patch: injected frames keep their
   sequence number and QoS header, and the monitor channel can be changed
   while another interface of the adapter is up.
