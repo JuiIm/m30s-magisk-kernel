@@ -31,23 +31,80 @@ static struct device *android_device;
 static DEFINE_MUTEX(android_device_lock);
 static int index;
 
+static int function_device_name_match(struct device *dev, const void *name)
+{
+	return !strcmp(dev_name(dev), name);
+}
+
+static int function_device_drvdata_match(struct device *dev, const void *data)
+{
+	return dev_get_drvdata(dev) == data;
+}
+
+/*
+ * The Samsung function drivers (mass_storage, midi, audio_source, conn_gadget)
+ * give every instance a device in /sys/class/android_usb with a fixed name.
+ * A second instance, for example in a second gadget, used to fail with
+ * -EEXIST, and so did creating an instance again after it was removed, because
+ * the device was never removed. The first instance keeps the stock name; any
+ * further one gets "<name>.1", "<name>.2", ...
+ */
+#define FUNCTION_DEVICE_MAX	32
+
 struct device *create_function_device(char *name)
 {
-	if (android_device && !IS_ERR(android_device)) {
-#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
-		if (!strcmp(name, "terminal_version"))
-			return android_device;
-		else
-#endif
-		{
-			return device_create(android_class, android_device,
-			MKDEV(0, index++), NULL, name);
-		}
-	} else {
+	char unique[48];
+	struct device *dev;
+	int i;
+
+	if (IS_ERR_OR_NULL(android_device))
 		return ERR_PTR(-EINVAL);
+
+#ifdef CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE
+	if (!strcmp(name, "terminal_version"))
+		return android_device;
+#endif
+
+	for (i = 0; i < FUNCTION_DEVICE_MAX; i++) {
+		if (i)
+			snprintf(unique, sizeof(unique), "%s.%d", name, i);
+		else
+			strlcpy(unique, name, sizeof(unique));
+		dev = class_find_device(android_class, NULL, unique,
+					function_device_name_match);
+		if (!dev)
+			break;
+		put_device(dev);
 	}
+	if (i == FUNCTION_DEVICE_MAX)
+		return ERR_PTR(-ENOSPC);
+
+	return device_create(android_class, android_device,
+			     MKDEV(0, index++), NULL, "%s", unique);
 }
 EXPORT_SYMBOL_GPL(create_function_device);
+
+/*
+ * Remove the device create_function_device() made for a function instance.
+ * @drvdata is what the function driver stored with dev_set_drvdata(), which
+ * is its usb_function_instance. To be called when the instance is freed, so
+ * that no device is left pointing at freed memory.
+ */
+void destroy_function_device(void *drvdata)
+{
+	struct device *dev;
+
+	if (!drvdata || IS_ERR_OR_NULL(android_class))
+		return;
+
+	dev = class_find_device(android_class, NULL, drvdata,
+				function_device_drvdata_match);
+	if (!dev)
+		return;
+	device_unregister(dev);
+	put_device(dev);
+}
+EXPORT_SYMBOL_GPL(destroy_function_device);
 #endif
 
 #ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER

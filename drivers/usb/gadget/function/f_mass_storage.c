@@ -3762,6 +3762,7 @@ static struct config_item_type fsg_func_type = {
 
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
 extern struct device *create_function_device(char *name);
+extern void destroy_function_device(void *drvdata);
 static ssize_t mass_storage_inquiry_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
@@ -3932,6 +3933,9 @@ static void fsg_free_inst(struct usb_function_instance *fi)
 {
 	struct fsg_opts *opts;
 
+#if defined(CONFIG_USB_CONFIGFS_UEVENT) && defined(CONFIG_USB_ANDROID_SAMSUNG_COMPOSITE)
+	destroy_function_device(fi);
+#endif
 	opts = fsg_opts_from_func_inst(fi);
 	fsg_common_put(opts->common);
 	kfree(opts);

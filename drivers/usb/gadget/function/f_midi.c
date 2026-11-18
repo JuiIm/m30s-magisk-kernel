@@ -1196,10 +1196,17 @@ static struct config_item_type midi_func_type = {
 	.ct_owner	= THIS_MODULE,
 };
 
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+extern void destroy_function_device(void *drvdata);
+#endif
+
 static void f_midi_free_inst(struct usb_function_instance *f)
 {
 	struct f_midi_opts *opts;
 
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	destroy_function_device(f);
+#endif
 	opts = container_of(f, struct f_midi_opts, func_inst);
 
 	if (opts->id_allocated)
