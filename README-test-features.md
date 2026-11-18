@@ -1,9 +1,18 @@
-# WiFi and Bluetooth test features (branches `wifi-monitor` and `bluetooth`)
+# Test features (branches `wifi-monitor`, `bluetooth`, `pentest-features`)
 
 Everything in this file is **compile tested only**. None of it has run on a
 phone yet. `unteth` does not contain any of it.
 
-The `bluetooth` branch is `wifi-monitor` plus the Bluetooth part.
+Each branch contains the one before it:
+`wifi-monitor` < `bluetooth` < `pentest-features`.
+
+| section | what | branch |
+| --- | --- | --- |
+| 1 | phone WiFi: monitor mode, channel hopping, injection | wifi-monitor, more in pentest-features |
+| 2 | external USB WiFi adapters | wifi-monitor, more in pentest-features |
+| 3 | Bluetooth | bluetooth |
+| 4 | USB gadget: mass storage / CD-ROM, more than one instance | pentest-features |
+| 5 | Linux chroot and network building blocks, CAN bus, file systems | pentest-features |
 
 ## 1. Phone WiFi (Samsung SCSC chip): monitor mode
 
@@ -34,6 +43,18 @@ then turn WiFi on in Android.
 
 With `iw` the usual way works too (`iw dev wlan0 set type monitor`,
 `iw dev wlan0 set channel 11`).
+
+Change the channel while it runs, or let the kernel hop (`pentest-features`):
+
+```
+echo 11  > /sys/module/scsc_wlan/parameters/monitor_channel   # retunes at once
+echo 250 > /sys/module/scsc_wlan/parameters/monitor_hop_ms    # hop every 250 ms
+echo Y   > /sys/module/scsc_wlan/parameters/monitor_hop_5g    # include 5 GHz
+echo 0   > /sys/module/scsc_wlan/parameters/monitor_hop_ms    # stop hopping
+```
+
+When the firmware gives no radiotap header, the one the driver adds carries
+the channel the interface is tuned to.
 
 What the kernel log tells you:
 
@@ -73,6 +94,18 @@ make ... INSTALL_MOD_PATH=<dir> INSTALL_MOD_STRIP=1 modules_install
 Load order: `ccm`, (`cmac` if it is a module), `mac80211`, then the driver's
 own dependencies from `modules.dep`, then the driver. Modules only load on
 the exact kernel build they were made with.
+
+In `pentest-features`:
+
+- `rtl8xxxu` is back, with RTL8188EU support (TP-Link TL-WN722N v2/v3) from
+  the Kali NetHunter patch set.
+- mac80211 has the NetHunter injection patch: injected frames keep their
+  sequence number and QoS header, and the monitor channel can be changed
+  while another interface of the adapter is up.
+- The regulatory database is built in (wireless-regdb 2017-12-23), so
+  `iw reg set US` (or your country) works without CRDA. Without it every
+  adapter is stuck in the restrictive world domain. The phone's own WiFi uses
+  its own rules and is not affected.
 
 ## 3. Bluetooth (`bluetooth` branch)
 
@@ -134,6 +167,47 @@ does not ship; plain CSR adapters need none.
 USB serial drivers for common BLE sniffer dongles are also built in:
 `cdc_acm` (nRF Sniffer, most CDC boards), `cp210x`, `ch341` (FTDI and PL2303
 were already there). They show up as `/dev/ttyACM0` or `/dev/ttyUSB0`.
+
+In `pentest-features` more Bluetooth USB adapters that need a firmware download
+at plug-in time are covered (`ath3k`, `bcm203x`, `bpa10x`, `bfusb`), the BCSP
+UART protocol, and the TP-Link UB500 USB ID.
+
+## 4. USB gadget additions (`pentest-features`)
+
+- The mass storage function is enabled (`CONFIG_USB_CONFIGFS_MASS_STORAGE`):
+  the phone can be a USB stick or a CD-ROM drive backed by an image file.
+- Samsung's function drivers gave every instance a sysfs device with a fixed
+  name and never removed it. A second `mass_storage` or `midi` instance (for
+  example in a second gadget) failed, and so did creating one again after
+  removing it. Further instances now get `<name>.1`, `<name>.2`, ... and the
+  device goes away with the instance.
+
+`gadget.sh` (in the modules package) wraps the common cases:
+
+```
+sh gadget.sh hid                    # keyboard + mouse
+sh gadget.sh type "hello"           # type through that keyboard
+sh gadget.sh cdrom /sdcard/x.iso    # CD-ROM with an image
+sh gadget.sh disk  /sdcard/x.img    # USB stick with an image
+sh gadget.sh net                    # USB network card (RNDIS + ECM)
+sh gadget.sh off                    # back to the phone's normal USB
+```
+
+## 5. Linux chroot, networking, CAN, file systems (`pentest-features`)
+
+Built in:
+
+- `SYSVIPC` (System V shared memory, semaphores, message queues). PostgreSQL
+  needs it, so Metasploit's database works in a chroot.
+- `BINFMT_MISC`.
+
+Modules (in the modules package, `sh load.sh <group>`):
+
+| group | modules |
+| --- | --- |
+| `net` | bridge (+ br_netfilter), veth, macvlan, 8021q, dummy, rndis_host, lan78xx |
+| `can` | can, can-raw, can-bcm, can-gw, vcan, slcan, gs_usb, peak_usb, kvaser_usb, usb_8dev, ems_usb, esd_usb2, mcba_usb |
+| `fs` | squashfs, isofs, udf, cifs, ntfs |
 
 ## If something goes wrong
 
